@@ -328,7 +328,7 @@ function renderResult(record) {
   sum.innerHTML = r.summary;
   $("btnExport").disabled = false;
   $("btnCopy").disabled = false;
-  // 误差校核/振动校准/逐管装载/应急迁移/装管复核/复称规划/配重补偿只针对已保存方案: 未保存(草稿)时禁用
+  // 误差校核/振动校准/逐管装载/应急迁移/装管复核/复称规划/配重补偿/备品替换只针对已保存方案: 未保存(草稿)时禁用
   $("btnWeighing").disabled = !(record.id !== null && record.id !== undefined);
   $("btnCalib").disabled = !(record.id !== null && record.id !== undefined);
   $("btnLoading").disabled = !(record.id !== null && record.id !== undefined);
@@ -336,6 +336,7 @@ function renderResult(record) {
   $("btnRecheck").disabled = !(record.id !== null && record.id !== undefined);
   $("btnReweigh").disabled = !(record.id !== null && record.id !== undefined);
   $("btnCw").disabled = !(record.id !== null && record.id !== undefined);
+  $("btnSpare").disabled = !(record.id !== null && record.id !== undefined);
 
   drawRotor(r);
   renderPairs(r);
@@ -607,6 +608,7 @@ async function renderHistory() {
         <button class="iconbtn" data-a="recheck">装管复核</button>
         <button class="iconbtn" data-a="reweigh">复称规划</button>
         <button class="iconbtn" data-a="cw">配重补偿</button>
+        <button class="iconbtn" data-a="spare">备品替换</button>
         <button class="iconbtn" data-a="export">导出</button>
         <button class="iconbtn" data-a="del">删除</button>
       </div>`;
@@ -630,6 +632,7 @@ async function renderHistory() {
     d.querySelector('[data-a="recheck"]').onclick = () => openRecheckDialog(it.id);
     d.querySelector('[data-a="reweigh"]').onclick = () => openReweighDialog(it.id);
     d.querySelector('[data-a="cw"]').onclick = () => openCwDialog(it.id);
+    d.querySelector('[data-a="spare"]').onclick = () => openSpareDialog(it.id);
     d.querySelector('[data-a="export"]').onclick = () => { window.location = `/api/plan/${it.id}/export`; };
     d.querySelector('[data-a="del"]').onclick = async () => {
       if (!confirm(`删除方案 #${it.id}?`)) return;
@@ -2098,6 +2101,285 @@ $("btnCw").onclick = () => {
   }
 };
 $("btnCloseCw").onclick = () => $("cwDialog").classList.remove("open");
+
+// ---------------------------------------------------------------------------
+// 备品试管替换(只读, 基于已保存方案; 备品不重复使用的一对一精确枚举)
+// ---------------------------------------------------------------------------
+const spState = { planId: null, plan: null, spares: [], selected: new Set() };
+
+async function openSpareDialog(id) {
+  $("btnSpare")?.blur();
+  try {
+    const resp = await fetch(`/api/plan/${id}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "方案读取失败");
+    spState.planId = id;
+    spState.plan = data;
+    spState.selected = new Set();
+    spState.spares = [{ id: nextSpareId(), mass: "" }];
+    const placed = data.result.placements.filter((p) => p.slot !== null && p.slot !== undefined);
+    $("spMeta").innerHTML =
+      `方案 <b>#${data.id} ${data.name}</b> · ${new Date(data.created_at).toLocaleString()} ·
+       R=${data.request.radius_mm}mm · ${data.result.config.rpm} rpm ·
+       ${placed.length} 支已放置试管 · 替换前 |U₁|=${fmt(data.result.metrics.u1_mag_g_mm)} g·mm`;
+    $("spLimit").value = "";
+    $("spareResult").innerHTML = "";
+    renderSpRepList(placed);
+    renderSpSpares();
+    $("btnSpRun").disabled = placed.length === 0;
+    $("spareDialog").classList.add("open");
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function nextSpareId() {
+  // 缺省备品编号避开方案已有管号(取最大编号之后)
+  const ids = spState.plan.result.placements.map((p) => p.tube_id);
+  return (ids.length ? Math.max(...ids) : 0) + 1;
+}
+
+function renderSpRepList(placed) {
+  const tb = $("spRepBody");
+  tb.innerHTML = "";
+  placed
+    .slice()
+    .sort((a, b) => a.tube_id - b.tube_id)
+    .forEach((p) => {
+      const tr = document.createElement("tr");
+      const checked = spState.selected.has(p.tube_id) ? "checked" : "";
+      tr.innerHTML = `
+        <td><input type="checkbox" ${checked}></td>
+        <td><b>#${p.tube_id}</b>${p.locked ? ' <span class="pill lock">锁定</span>' : ""}</td>
+        <td>槽 ${p.slot} <span class="small">(${fmt(p.angle, 1)}°)</span></td>
+        <td style="text-align:right">${fmt(p.mass, 3)}</td>
+        <td class="small">备品将装入原槽 ${p.slot}</td>`;
+      const cb = tr.querySelector('input[type="checkbox"]');
+      cb.onchange = () => {
+        if (cb.checked) {
+          if (spState.selected.size >= 4) {
+            cb.checked = false;
+            toast("待换管最多选择 4 支。", true);
+            return;
+          }
+          spState.selected.add(p.tube_id);
+        } else {
+          spState.selected.delete(p.tube_id);
+        }
+        updateSpRepCount();
+      };
+      tb.appendChild(tr);
+    });
+  updateSpRepCount();
+}
+
+function updateSpRepCount() {
+  const n = spState.selected.size;
+  $("spRepCount").textContent =
+    `已选 ${n} 支待换管(1~4 支)${n === 0 ? " · 请至少勾选 1 支" : `: ${[...spState.selected].sort((a, b) => a - b).join(", ")}`}`;
+}
+
+function renderSpSpares() {
+  const tb = $("spSpareBody");
+  tb.innerHTML = "";
+  spState.spares.forEach((s, i) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>备品 ${i + 1}</td>
+      <td><input type="number" step="1" data-f="id" value="${s.id}" placeholder="唯一编号"></td>
+      <td><input type="number" min="0" step="any" data-f="mass" value="${s.mass}" placeholder="如 50.5"></td>
+      <td><button class="iconbtn" data-act="del">删</button></td>`;
+    tr.querySelector('[data-f="id"]').oninput = (e) => { s.id = parseInt(e.target.value, 10); };
+    tr.querySelector('[data-f="mass"]').oninput = (e) => { s.mass = e.target.value; };
+    tr.querySelector('[data-act="del"]').onclick = () => {
+      spState.spares.splice(i, 1);
+      renderSpSpares();
+    };
+    tb.appendChild(tr);
+  });
+  $("spSpareCount").textContent = `共 ${spState.spares.length} / 12 支`;
+}
+
+$("btnSpAdd").onclick = () => {
+  if (spState.spares.length >= 12) { toast("备品试管最多 12 支。", true); return; }
+  // 缺省编号在已有编号(含方案管号)之上递增
+  const planIds = spState.plan ? spState.plan.result.placements.map((p) => p.tube_id) : [];
+  const used = new Set([...planIds, ...spState.spares.map((s) => s.id)]);
+  let cand = (planIds.length ? Math.max(...planIds) : 0) + 1;
+  while (used.has(cand)) cand += 1;
+  spState.spares.push({ id: cand, mass: "" });
+  renderSpSpares();
+};
+
+$("btnSpRun").onclick = async () => {
+  const btn = $("btnSpRun");
+  btn.disabled = true;
+  try {
+    if (spState.selected.size < 1 || spState.selected.size > 4) {
+      toast("请选择 1~4 支待换管。", true); return;
+    }
+    if (!spState.spares.length) { toast("请至少录入一支备品。", true); return; }
+    if (spState.spares.length > 12) { toast("备品试管最多 12 支。", true); return; }
+    const planIds = new Set(spState.plan.result.placements.map((p) => p.tube_id));
+    const idSeen = new Set();
+    const spares = [];
+    for (const [i, s] of spState.spares.entries()) {
+      if (!Number.isInteger(s.id)) { toast(`第 ${i + 1} 支备品的编号必须为整数。`, true); return; }
+      if (idSeen.has(s.id)) { toast(`备品编号 ${s.id} 重复。`, true); return; }
+      if (planIds.has(s.id)) {
+        toast(`备品编号 ${s.id} 与原方案试管编号冲突, 请更换编号。`, true); return;
+      }
+      const m = parseFloat(s.mass);
+      if (!(m > 0) || !Number.isFinite(m)) {
+        toast(`备品 ${s.id} 的质量必须为正的有限数。`, true); return;
+      }
+      idSeen.add(s.id);
+      spares.push({ tube_id: s.id, mass_g: m });
+    }
+    if (spares.length < spState.selected.size) {
+      toast(`备品仅 ${spares.length} 支, 不足以一对一替换 ${spState.selected.size} 支待换管(备品不得重复使用)。`, true);
+      return;
+    }
+    const limit = parseFloat($("spLimit").value);
+    if (!(limit >= 0) || !Number.isFinite(limit)) {
+      toast("一阶不平衡量限值必须为非负有限数。", true); return;
+    }
+    const resp = await fetch(`/api/plan/${spState.planId}/spare-replacement`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        replaced_tube_ids: [...spState.selected].sort((a, b) => a - b),
+        spares,
+        u1_limit_g_mm: limit,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "备品试管替换规划失败");
+    renderSpareResult(data);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+function renderSpareResult(d) {
+  const box = $("spareResult");
+  const baseM = d.baseline.u1_mag_g_mm;
+  const finalM = d.final.u1_mag_g_mm;
+  const mapTxt = d.mappings.map((m) =>
+    `管 ${m.replaced_tube_id}(${fmt(m.original_mass_g, 3)} g, 槽 ${m.slot}) → 备品 ${m.spare_tube_id}(${fmt(m.spare_mass_g, 3)} g)`).join("；");
+
+  let verdict;
+  if (d.feasible) {
+    verdict = `<div class="wc-ok">✔ <b>达标</b>: 共精确枚举 <b>${d.evaluated_mappings}</b> 种备品一对一(不重复)映射,
+      其中 <b>${d.feasible_mapping_count}</b> 种满足残余 |U₁| ≤ 限值 ${fmt(d.u1_limit_g_mm)} g·mm。
+      已取<b>总质量差最小</b>的映射: 总质量差 <b>${fmt(d.total_mass_diff_g, 3)} g</b>(${mapTxt}),
+      替换后残余 |U₁|=<b>${fmt(finalM)}</b> g·mm ≤ 限值, 余量 ${fmt(d.margin_g_mm)} g·mm
+      (替换前 ${fmt(baseM)} g·mm)。${d.tie_broken
+        ? `总质量差/残余并列时已按残余 |U₁| 及待换管号顺序对应的备品编号裁决(并列映射 ${d.optimal_mapping_count} 种)。`
+        : "最优映射唯一。"}</div>`;
+  } else {
+    verdict = `<div class="wc-bad">✘ <b>无法达标</b>: 共精确枚举 ${d.evaluated_mappings} 种备品一对一(不重复)映射,
+      没有使残余 |U₁| ≤ 限值 ${fmt(d.u1_limit_g_mm)} g·mm 的映射。
+      <b>残余最低</b>的映射总质量差 ${fmt(d.total_mass_diff_g, 3)} g(${mapTxt}),
+      残余 |U₁|=<b>${fmt(finalM)}</b> g·mm, 仍<b>超出 ${fmt(d.excess_g_mm)} g·mm</b>
+      (替换前 ${fmt(baseM)} g·mm), 判定不达标。${d.tie_broken
+        ? ` 残余并列时已按待换管号顺序对应的备品编号裁决(并列映射 ${d.optimal_mapping_count} 种)。`
+        : ""}</div>`;
+  }
+
+  const head = `<div class="wc-note">待换管 ${d.replace_count} 支(管号 ${d.replaced_tube_ids.join(", ")}) ·
+    备品 ${d.spare_count} 支 · 精确评估映射 P(s,r)=<b>${d.evaluated_mappings}</b> 种 ·
+    转子 R=${fmt(d.radius_mm, 1)} mm · ${d.rpm} rpm。备品装入待换管原槽, 未换管 ${d.unchanged_tubes.length} 支保留不动。</div>`;
+
+  const deltaColor = d.improvement_g_mm > 1e-9 ? "delta-down"
+    : (d.improvement_g_mm < -1e-9 ? "delta-up" : "delta-flat");
+  const cmpTable = `<table class="cmp-table">
+    <thead><tr><th>指标</th><th style="text-align:right">替换前</th>
+      <th style="text-align:right">替换后(推荐映射)</th><th style="text-align:right">变化</th></tr></thead>
+    <tbody>
+      <tr><td>一阶不平衡量 |U₁| (g·mm)</td>
+        <td style="text-align:right">${fmt(baseM)}</td>
+        <td style="text-align:right" class="wc-hi">${fmt(finalM)}</td>
+        <td style="text-align:right" class="${deltaColor}">${
+          Math.abs(d.improvement_g_mm) > 1e-9 ? (d.improvement_g_mm > 0 ? "−" : "+") + fmt(Math.abs(d.improvement_g_mm)) : "0"}</td></tr>
+      <tr><td>U₁ 方向</td>
+        <td style="text-align:right">${fmt(d.baseline.u1_angle_deg, 1)}°</td>
+        <td style="text-align:right">${fmt(d.final.u1_angle_deg, 1)}°</td>
+        <td style="text-align:right">–</td></tr>
+      <tr><td>离心合力 F (N)</td>
+        <td style="text-align:right">${fmt(d.baseline.centrifugal_force_n, 3)}</td>
+        <td style="text-align:right">${fmt(d.final.centrifugal_force_n, 3)}</td>
+        <td style="text-align:right">–</td></tr>
+      <tr><td>试管总质量 (g)</td>
+        <td style="text-align:right">${fmt(d.baseline.total_mass_g, 3)}</td>
+        <td style="text-align:right">${fmt(d.final.total_mass_g, 3)}</td>
+        <td style="text-align:right" class="${d.mass_change_g < -1e-9 ? "delta-up" : d.mass_change_g > 1e-9 ? "delta-down" : "delta-flat"}">
+          ${d.mass_change_g === 0 ? "0" : (d.mass_change_g > 0 ? "+" : "−") + fmt(Math.abs(d.mass_change_g), 3)}</td></tr>
+      <tr><td>总质量差 Σ|m′−m| (g)</td>
+        <td style="text-align:right">–</td>
+        <td style="text-align:right">${fmt(d.total_mass_diff_g, 3)}</td>
+        <td style="text-align:right">达标时首要裁决依据</td></tr>
+      <tr><td>限值 ${fmt(d.u1_limit_g_mm)} g·mm 判定</td>
+        <td style="text-align:right">${d.baseline.within_limit
+          ? '<span class="delta-down">合格</span>'
+          : `<span class="delta-up">超限 ${fmt(d.baseline.excess_g_mm)}</span>`}</td>
+        <td style="text-align:right">${d.within_limit
+          ? '<span class="delta-down">合格</span>'
+          : `<span class="delta-up">超限 ${fmt(d.excess_g_mm)}</span>`}</td>
+        <td style="text-align:right">–</td></tr>
+    </tbody></table>`;
+
+  const mapRows = d.mappings.map((m) => `<tr>
+    <td><b>#${m.replaced_tube_id}</b>${m.locked ? ' <span class="pill lock">锁定</span>' : ""}</td>
+    <td>${fmt(m.original_mass_g, 3)}</td>
+    <td>槽 ${m.slot} <span class="small">(${fmt(m.angle_deg, 1)}°)</span></td>
+    <td><b class="delta-down">#${m.spare_tube_id}</b></td>
+    <td><b>${fmt(m.spare_mass_g, 3)}</b></td>
+    <td style="text-align:right" class="${m.mass_diff_g < -1e-9 ? "delta-up" : m.mass_diff_g > 1e-9 ? "delta-down" : "delta-flat"}">
+      ${m.mass_diff_g === 0 ? "0" : (m.mass_diff_g > 0 ? "+" : "−") + fmt(Math.abs(m.mass_diff_g), 3)}</td>
+    <td style="text-align:right">${fmt(m.original_u1.u1_mag_g_mm)}</td>
+    <td style="text-align:right">${fmt(m.final_u1.u1_mag_g_mm)}</td>
+  </tr>`).join("");
+  const mapTable = `
+    <h2 style="font-size:13px;margin:10px 0 6px">逐管替换映射
+      <span class="small">备品装入待换管原槽(槽角/半径不变), 备品不重复使用</span></h2>
+    <table class="cmp-table wc-table">
+      <thead><tr><th>待换管</th><th>原质量(g)</th><th>原槽位 / 角度</th>
+        <th>备品编号</th><th>备品质量(g)</th><th style="text-align:right">质量差(g)</th>
+        <th style="text-align:right">原 |U₁| 贡献</th><th style="text-align:right">替换后贡献</th></tr></thead>
+      <tbody>${mapRows}</tbody>
+    </table>`;
+
+  let keepTable = "";
+  if (d.unchanged_tubes.length) {
+    const rows = d.unchanged_tubes.map((t) => `<tr>
+      <td><b>#${t.tube_id}</b>${t.locked ? ' <span class="pill lock">锁定</span>' : ""}</td>
+      <td>${fmt(t.mass_g, 3)}</td>
+      <td>槽 ${t.slot} <span class="small">(${fmt(t.angle_deg, 1)}°)</span></td>
+      <td class="small">保留不动</td>
+    </tr>`).join("");
+    keepTable = `
+      <h2 style="font-size:13px;margin:10px 0 6px">未换管(保留原槽位)</h2>
+      <table class="cmp-table wc-table">
+        <thead><tr><th>试管</th><th>质量(g)</th><th>槽位 / 角度</th><th>状态</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  box.innerHTML = `${verdict}${head}${cmpTable}${mapTable}${keepTable}
+    <div class="small" style="margin-top:6px">算法: ${d.method}。${d.note}
+      方案 #${d.plan.id} 未被修改。</div>`;
+}
+
+$("btnSpare").onclick = () => {
+  if (state.record && state.record.id !== null && state.record.id !== undefined) {
+    openSpareDialog(state.record.id);
+  } else {
+    toast("请先从历史方案载入一条已保存方案, 或先计算并保存方案。", true);
+  }
+};
+$("btnCloseSpare").onclick = () => $("spareDialog").classList.remove("open");
 
 // ---------------------------------------------------------------------------
 // 标签页 & 初始化

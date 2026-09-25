@@ -24,6 +24,7 @@ from .evacuation import plan_slot_evacuation
 from .loading import plan_loading_sequence
 from .recheck import recheck_tube_loading
 from .reweigh import plan_reweigh
+from .spare_replacement import plan_spare_replacement
 from .weighing import worst_case_u1
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -182,6 +183,23 @@ class CounterweightCompensationRequest(BaseModel):
     u1_limit_g_mm: float = Field(ge=0)
     # 最多放置枚数(0~3, 控制精确枚举的搜索规模)
     max_weights: int = Field(ge=0, le=3)
+
+
+class SpareTubeIn(BaseModel):
+    # 一支备品试管: 唯一编号(不得与原方案管号冲突, 由规划逻辑统一校验)
+    # 与正质量(g); 有限性由规划逻辑统一校验并返回 400(避免 pydantic 回显
+    # NaN/Inf 导致错误响应无法 JSON 序列化)
+    tube_id: int
+    mass_g: float = Field(gt=0)
+
+
+class SpareReplacementRequest(BaseModel):
+    # 待换管编号(1~4 支, 不重复, 均须为方案中已放置试管)
+    replaced_tube_ids: list[int] = Field(min_length=1, max_length=4)
+    # 备品试管(1~12 支): 编号唯一、质量为正, 且不与原方案管号冲突
+    spares: list[SpareTubeIn] = Field(min_length=1, max_length=12)
+    # 一阶不平衡量限值(g·mm), 必填的非负数, 以最终 |U₁| 判定
+    u1_limit_g_mm: float = Field(ge=0)
 
 
 class PlanRequest(BaseModel):
@@ -640,6 +658,29 @@ def counterweight_compensation(
             weights=[w.model_dump() for w in req.weights],
             u1_limit_g_mm=req.u1_limit_g_mm,
             max_weights=req.max_weights,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/plan/{plan_id}/spare-replacement")
+def spare_replacement(plan_id: int, req: SpareReplacementRequest) -> dict[str, Any]:
+    """对已保存方案做备品试管替换规划(只读): 保留原槽位与未换管, 不覆盖原方案。
+
+    选定 1~4 支待换管(均为方案中已放置试管), 录入 1~12 支编号唯一、质量为正
+    且不与原方案管号冲突的备品及一阶不平衡量限值。备品装入待换管原槽, 备品
+    不重复使用(一对一映射), 未换管及其槽位保持不动; 服务端按原槽角度与半径
+    精确枚举全部 P(s,r) 个映射并重算最终 |U₁|: 在达标映射中先取总质量差最小
+    者, 再按残余 |U₁| 及待换管号顺序对应的备品编号序列裁决; 无达标映射时
+    返回残余最低的映射、超限量与不达标结论。结果不保存、不覆盖原方案。
+    """
+    plan = _row_to_plan(_load_plan_row(plan_id))
+    try:
+        return plan_spare_replacement(
+            plan,
+            replaced_tube_ids=list(req.replaced_tube_ids),
+            spares=[s.model_dump() for s in req.spares],
+            u1_limit_g_mm=req.u1_limit_g_mm,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

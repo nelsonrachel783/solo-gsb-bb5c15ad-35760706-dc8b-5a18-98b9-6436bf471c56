@@ -1086,6 +1086,102 @@ assert call("GET", f"/api/plan/{cwid}")["result"]["metrics"]["u1_mag_g_mm"] == \
 print("counterweight validation/read-only OK")
 
 
+# ---- 备品试管替换(只读, 备品不重复使用的一对一精确枚举) ----
+def sp_call(plan_id, replaced, spares, limit):
+    found = find("POST", f"/api/plan/{plan_id}/spare-replacement")
+    fn, args = (found if isinstance(found, tuple) else (found, ()))
+    req = types.SimpleNamespace(
+        replaced_tube_ids=[int(t) for t in replaced],
+        spares=[types.SimpleNamespace(
+            tube_id=int(s[0]), mass_g=float(s[1]),
+            model_dump=(lambda s=s: {"tube_id": int(s[0]),
+                                     "mass_g": float(s[1])}))
+                for s in spares],
+        u1_limit_g_mm=float(limit),
+    )
+    return fn(*args, req)
+
+# 确定性方案: 两支 50g 试管锁定在对径槽 0/6(标称 |U₁|=0)
+sp_body = dict(rw_body)
+sp_body["name"] = "备品替换方案"
+sp_body["tubes"] = [
+    {"id": 1, "mass": 50, "locked": True, "slot": 0},
+    {"id": 2, "mass": 50, "locked": True, "slot": 6},
+]
+rec_sp = call("POST", "/api/plan", sp_body)
+spid = rec_sp["id"]
+assert abs(rec_sp["result"]["metrics"]["u1_mag_g_mm"]) < 1e-6
+# 同质量备品 10 替换管 1: 残余 0、总质量差 0, 原槽位不变
+sp0 = sp_call(spid, [1], [(10, 50.0)], 100.0)
+assert sp0["feasible"] is True and sp0["within_limit"] is True
+assert sp0["evaluated_mappings"] == 1 and sp0["feasible_mapping_count"] == 1
+assert sp0["mappings"][0]["spare_tube_id"] == 10
+assert sp0["mappings"][0]["slot"] == 0 and sp0["mappings"][0]["replaced_tube_id"] == 1
+assert abs(sp0["total_mass_diff_g"]) < 1e-12
+assert abs(sp0["final"]["u1_mag_g_mm"]) < 1e-6
+# 未换管 2 保留在槽 6
+assert len(sp0["unchanged_tubes"]) == 1
+assert sp0["unchanged_tubes"][0]["tube_id"] == 2 and \
+       sp0["unchanged_tubes"][0]["slot"] == 6
+# 目标排序: 限值宽松时两备品都达标, 先取总质量差最小的 50g 备品(编号 11);
+# 限值 50 时均不达标(49g→残余100, 48g→残余200), 返回残余最低的 49g(编号 10)+超限量
+sp1 = sp_call(spid, [1], [(10, 49.0), (11, 50.0)], 5000.0)
+assert sp1["feasible"] is True and sp1["feasible_mapping_count"] == 2
+assert sp1["mappings"][0]["spare_tube_id"] == 11
+sp_no = sp_call(spid, [1], [(10, 49.0), (11, 48.0)], 50.0)
+assert sp_no["feasible"] is False and sp_no["within_limit"] is False
+assert sp_no["feasible_mapping_count"] == 0
+assert sp_no["mappings"][0]["spare_tube_id"] == 10
+assert abs(sp_no["final"]["u1_mag_g_mm"] - 100.0) < 1e-6
+assert abs(sp_no["excess_g_mm"] - 50.0) < 1e-6
+assert "不达标" in sp_no["reason"]
+# 两支待换、三支备品: P(3,2)=6; 同质量两指派并列, 按备品编号序列取 (10,11)
+sp2 = sp_call(spid, [2, 1], [(12, 49.0), (11, 50.0), (10, 50.0)], 100.0)
+assert sp2["feasible"] is True and sp2["evaluated_mappings"] == 6
+assert sp2["replaced_tube_ids"] == [1, 2]
+assert [m["spare_tube_id"] for m in sp2["mappings"]] == [10, 11]
+assert sp2["optimal_mapping_count"] == 2 and sp2["tie_broken"] is True
+# 备品不重复使用
+used_ids = [m["spare_tube_id"] for m in sp2["mappings"]]
+assert len(used_ids) == len(set(used_ids))
+# 前/后总质量与质径积独立一致
+assert abs(sp0["baseline"]["total_mass_g"] - 100.0) < 1e-9
+assert abs(sp0["final"]["total_mass_g"] - 100.0) < 1e-9
+print("spare-replacement feasible/infeasible/tie-break OK")
+
+# 校验错误: 待换管不存在 / 重复 / 超过 4 / 备品与原方案冲突 / 备品重复 /
+#           备品不足 / 非正质量 / 负限值 -> 400
+for bad_sp in (
+    (spid, [9], [(10, 50.0)], 100.0),             # 待换管不在方案中
+    (spid, [1, 1], [(10, 50.0)], 100.0),          # 待换管重复
+    (spid, [1, 2, 1, 2, 2], [(10, 50.0)], 100.0), # 待换管超过 4
+    (spid, [1], [(2, 50.0)], 100.0),              # 备品编号与原方案冲突
+    (spid, [1], [(10, 50.0), (10, 51.0)], 100.0), # 备品编号重复
+    (spid, [1, 2], [(10, 50.0)], 100.0),          # 备品少于待换管
+    (spid, [1], [(10, 0.0)], 100.0),              # 备品质量非正
+    (spid, [1], [(10, -3.0)], 100.0),             # 备品质量为负
+    (spid, [1], [(10, 50.0)], -1.0),              # 负限值
+):
+    try:
+        sp_call(*bad_sp); raise SystemExit("should 400")
+    except main.HTTPException as e:
+        assert e.status_code == 400, (bad_sp, e)
+# 方案不存在 -> 404
+try:
+    sp_call(999, [1], [(10, 50.0)], 100.0); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code == 404
+# 只读: 替换规划后原方案编号/质量/落槽与指标均不变
+sp_after = call("GET", f"/api/plan/{spid}")
+assert [(p["tube_id"], p["mass"], p["slot"])
+        for p in sp_after["result"]["placements"]] == \
+       [(p["tube_id"], p["mass"], p["slot"])
+        for p in rec_sp["result"]["placements"]]
+assert sp_after["result"]["metrics"]["u1_mag_g_mm"] == \
+       rec_sp["result"]["metrics"]["u1_mag_g_mm"]
+print("spare-replacement validation/read-only OK")
+
+
 # ---- 互斥试管隔离(精确完全枚举; 禁用槽仍占物理相邻关系) ----
 import itertools as _itx
 

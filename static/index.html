@@ -228,6 +228,7 @@ th{color:var(--mut);font-weight:500}
       <button id="btnRecheck" disabled title="对已保存方案做现场装管复核(只读, 一对一匹配)">现场装管复核</button>
       <button id="btnReweigh" disabled title="对已保存方案做复称规划(只读, 精确枚举复称组合)">复称规划</button>
       <button id="btnCw" disabled title="对已保存方案做库存配重补偿(只读, 按枚数分层精确枚举槽位×质量组合)">库存配重补偿</button>
+      <button id="btnSpare" disabled title="对已保存方案做备品试管替换规划(只读, 精确枚举一对一映射)">备品试管替换</button>
       <button id="btnExport" disabled>导出 JSON</button>
       <button id="btnCopy" disabled>复制 JSON</button>
     </div>
@@ -578,6 +579,51 @@ th{color:var(--mut);font-weight:500}
       </div>
     </div>
     <div id="cwResult" style="margin-top:6px"></div>
+  </div>
+</div>
+
+<div id="spareDialog" class="dialog">
+  <div class="box wider">
+    <div class="rowline"><h2 style="margin:0">备品试管替换规划</h2><div style="flex:1"></div>
+      <button id="btnCloseSpare" class="ghost">关闭</button></div>
+    <div class="wc-note">从方案中选定 <b>1~4 支待换管</b>, 录入至多 <b>12 支备品</b>(编号唯一、质量为正、
+      不得与原方案管号冲突)与<b>一阶不平衡量限值</b>。备品直接落在待换管<b>原槽位</b>
+      (原角度与半径不变), <b>未换管全部保留</b>。服务端对备品不重复使用的<b>一对一映射</b>
+      做精确完全枚举, 按原槽角度与半径重算最终 |U₁|: 在<b>达标映射</b>中先选
+      <b>总质量差</b>(绝对质量差之和)最小者, 再按<b>残余 |U₁|</b> 及<b>待换管号顺序对应的备品编号</b>
+      裁决; 无达标映射时返回<b>残余最低</b>的映射、超限量与不达标结论, 不误报达标。
+      规划为<b>只读</b>, 结果不保存、不覆盖原方案。</div>
+    <div id="spareMeta" class="small" style="margin:4px 0 8px"></div>
+    <h2 style="font-size:13px;margin:8px 0 6px">① 待换管(1~4 支, 勾选方案中已放置的试管)</h2>
+    <div style="max-height:200px;overflow:auto">
+      <table class="wc-table">
+        <thead><tr><th style="width:44px">替换</th><th>试管</th><th>槽位 / 角度</th>
+          <th>标称质量(g)</th><th>状态</th></tr></thead>
+        <tbody id="spTargetBody"></tbody>
+      </table>
+    </div>
+    <h2 style="font-size:13px;margin:12px 0 6px">② 备品试管(编号唯一, 不与原方案管号冲突; 至多 12 支)</h2>
+    <div style="max-height:200px;overflow:auto">
+      <table class="wc-table">
+        <thead><tr><th style="width:70px">序号</th><th style="width:150px">备品编号</th>
+          <th style="width:170px">质量(g)</th><th style="width:44px"></th></tr></thead>
+        <tbody id="spSpareBody"></tbody>
+      </table>
+    </div>
+    <div class="rowline" style="margin-top:6px">
+      <button id="btnSpAdd" class="iconbtn">+ 添加备品</button>
+      <span class="small" id="spSpareCount"></span>
+    </div>
+    <div class="rowline" style="gap:10px;flex-wrap:wrap;margin:10px 0 8px">
+      <div style="flex:1;min-width:200px">
+        <label>③ 一阶不平衡量限值 |U₁| (g·mm), 必填</label>
+        <input id="spLimit" type="number" min="0" step="any" placeholder="例如 1000">
+      </div>
+      <div style="align-self:flex-end">
+        <button id="btnSpRun" class="primary">计算替换规划</button>
+      </div>
+    </div>
+    <div id="spareResult" style="margin-top:6px"></div>
   </div>
 </div>
 
